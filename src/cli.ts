@@ -69,6 +69,7 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     userpromptsubmit: "hooks/userpromptsubmit.mjs",
   },
   "gemini-cli": {
+    beforeagent: "hooks/gemini-cli/beforeagent.mjs",
     beforetool: "hooks/gemini-cli/beforetool.mjs",
     aftertool: "hooks/gemini-cli/aftertool.mjs",
     precompress: "hooks/gemini-cli/precompress.mjs",
@@ -1454,7 +1455,33 @@ async function upgrade(opts?: { platform?: string }) {
     const message = err instanceof Error ? err.message : String(err);
     s.stop(color.red("Update failed"));
     p.log.error(color.red("GitHub pull failed") + ` — ${message}`);
-    p.log.info(color.dim("Continuing with hooks/settings fix..."));
+
+    // Issue #628 — Windows `spawnSync cmd.exe ETIMEDOUT` (and any
+    // other Step 1/2 throw — network, npm, manifest mismatch) used
+    // to fall through to Steps 3-7 (backup, hooks, perms, doctor),
+    // all of which succeed against the OLD on-disk install. The
+    // process then exited 0 and the upgrade-checklist renderer
+    // marked `[x] Built and installed vNEW` while in-place files,
+    // installed_plugins.json registry, and per-version cache dirs
+    // stayed at vOLD. Worse: the marketplace clone synced earlier
+    // in this same run is now AHEAD of cache+registry — Claude
+    // Code's plugin manager keeps offering the same upgrade
+    // forever (drift trap; reporter had to hand-edit
+    // installed_plugins.json to escape).
+    //
+    // Algo defense: mark the process for non-zero exit and surface
+    // an actionable recovery hint. Steps 3-7 still run because the
+    // user's hooks may be broken regardless — but the overall
+    // upgrade no longer reports success.
+    process.exitCode = 1;
+    p.log.warn(
+      color.yellow("In-place files were NOT updated") +
+        color.dim(" — old version is still on disk; hooks/settings will still be refreshed."),
+    );
+    p.log.info(
+      color.dim("  Recovery: re-run /ctx-upgrade once network is stable, or run /context-mode:ctx-doctor for a full health check."),
+    );
+
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 

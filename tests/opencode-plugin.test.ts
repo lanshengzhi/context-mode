@@ -130,7 +130,7 @@ describe("ContextModePlugin", () => {
     // the fix, registered.handler(args ?? {}) ran without parsing,
     // so commands could arrive as `undefined` or `"[...]"`, and the
     // handler crashed with `commands.map is not a function`.
-    describe("#621: native plugin runs Zod preprocessing on args", () => {
+    describe("#621/#627: native plugin runs Zod preprocessing on args", () => {
       const baseCtx = (projectDir: string) => ({
         sessionID: "issue-621-sess",
         messageID: "issue-621-msg",
@@ -227,6 +227,100 @@ describe("ContextModePlugin", () => {
         // Should not throw; output is a normal search response (possibly
         // "No results" / guidance) but never the JS TypeError symptom.
         expect(typeof output).toBe("string");
+      });
+
+      // ─────────────────────────────────────────────────────────
+      // #627: same root cause class as #621, but for primitive coercion.
+      // OpenCode's plugin host (and several LLM providers' tool-call JSON)
+      // stringifies *primitive* args too — limit:"4" instead of limit:4,
+      // background:"false" instead of background:false. v1.0.139 (#621)
+      // started running inputSchema.parse() on the native path, which made
+      // these mismatches visible as "Invalid arguments" errors. The fix is
+      // to use z.coerce.* on the schemas (mirrors what ctx_batch_execute's
+      // timeout/concurrency and ctx_fetch_and_index's concurrency already
+      // do), AND to widen coerceJsonArray to lift bare-string queries.
+      // ─────────────────────────────────────────────────────────
+
+      it("ctx_search accepts stringified limit (#627 exact reporter case)", async () => {
+        const projectDir = join(tempDir, "issue-627-limit-string");
+        const plugin = await createTestPlugin(projectDir);
+        // Reporter's exact call shape: queries arrives as JSON string AND
+        // limit arrives as a number-string. v1.0.140's plain z.number()
+        // rejects "4" with "Expected number, received string".
+        const result = await plugin.tool!.ctx_search.execute(
+          {
+            queries: JSON.stringify([
+              "HTML file mermaid rendering flowchart display issue",
+            ]) as unknown as string[],
+            limit: "4" as unknown as number,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should NOT throw — z.coerce.number() turns "4" into 4 before
+        // the handler sees it; queries coercion turns the JSON string
+        // into an array. Output is a normal "no results yet" guidance.
+        expect(typeof output).toBe("string");
+      });
+
+      it("ctx_search lifts bare-string queries into single-element array (#627)", async () => {
+        const projectDir = join(tempDir, "issue-627-bare-query");
+        const plugin = await createTestPlugin(projectDir);
+        // Some LLM providers send a single query as a bare string rather
+        // than a JSON-stringified array. Without widening, coerceJsonArray
+        // returns the string unchanged → z.array(z.string()) rejects it.
+        const result = await plugin.tool!.ctx_search.execute(
+          {
+            queries: "single bare query" as unknown as string[],
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(typeof output).toBe("string");
+      });
+
+      it("ctx_execute accepts stringified background boolean (#627)", async () => {
+        // The project dir must exist on disk: the shell pipeline spawns
+        // /bin/zsh with cwd=projectDir, and Node's spawn() returns ENOENT
+        // for the shell binary itself when cwd doesn't exist (misleading
+        // — /bin/zsh is fine). The other tests in this block don't notice
+        // because ctx_batch_execute catches per-cmd executor errors and
+        // still returns its "Executed ..." wrapper text.
+        const projectDir = join(tempDir, "issue-627-background-bool");
+        mkdirSync(projectDir, { recursive: true });
+        const plugin = await createTestPlugin(projectDir);
+        // background: z.boolean() rejects "false". z.coerce.boolean would
+        // coerce — but Boolean("false") is true. Instead we use a small
+        // preprocessor (coerceBoolean) that maps "true"/"false" literals
+        // back to booleans and leaves real booleans untouched.
+        const result = await plugin.tool!.ctx_execute.execute(
+          {
+            language: "shell",
+            code: "echo issue627-bg",
+            background: "false" as unknown as boolean,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should run synchronously (background coerced to false) and emit
+        // the echoed line — never throw "Invalid arguments for ctx_execute".
+        expect(output).toContain("issue627-bg");
+      });
+
+      it("ctx_purge accepts stringified confirm boolean (#627)", async () => {
+        const projectDir = join(tempDir, "issue-627-purge-confirm");
+        const plugin = await createTestPlugin(projectDir);
+        // confirm: z.boolean() rejects "false". With the boolean coercion
+        // fix, "false" becomes false → ctx_purge returns "purge cancelled"
+        // (its documented refusal path) instead of throwing on validation.
+        const result = await plugin.tool!.ctx_purge.execute(
+          {
+            confirm: "false" as unknown as boolean,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(output).toMatch(/cancel/i);
       });
     });
 

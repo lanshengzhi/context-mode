@@ -139,4 +139,70 @@ describe("cli.ts upgrade() — better-sqlite3 binding verification (#514)", () =
     const region = body.slice(Math.max(0, callIdx - 200), callIdx + 1500);
     expect(region).toMatch(/try\s*\{[\s\S]*?discoverSiblingMcpPids[\s\S]*?\}\s*catch/);
   });
+
+  // ─────────────────────────────────────────────────────────
+  // Issue #628 — Windows `spawnSync cmd.exe ETIMEDOUT` during the
+  // Step 1 `git clone` causes upgrade() to fall into the catch
+  // block at the bottom of the Step 1/2/3 try. Historically the
+  // catch logged "GitHub pull failed" then printed "Continuing
+  // with hooks/settings fix..." and let execution fall through to
+  // Steps 4-7 (backup, hooks, perms, doctor) — all of which
+  // succeed against the OLD on-disk install. /ctx-upgrade then
+  // exits 0 and the user's checklist renders `[x] Built and
+  // installed v1.0.140` while in-place files + installed_plugins
+  // registry are still v1.0.123. Marketplace clone (synced earlier
+  // in the same run) ends up ahead of cache+registry → drift trap
+  // that the user can only escape by hand-editing
+  // installed_plugins.json (the workaround reported in #628).
+  //
+  // Contract this test locks down:
+  //   1. The GitHub-pull failure must mark the upgrade process for
+  //      a non-zero exit (same algo-defense pattern as #514's
+  //      missing-binding branch already at lines ~1395).
+  //   2. The historical "Continuing with hooks/settings fix..."
+  //      false-reassurance string MUST NOT appear inside the
+  //      catch — it tells the user the upgrade self-recovered
+  //      when in fact only Steps 4-7 ran against the OLD version.
+  //   3. The catch must reference v1.0.114's marketplace drift
+  //      warning vocabulary OR an equivalent recovery hint, so
+  //      the user can self-remediate without filing a new issue.
+  // ─────────────────────────────────────────────────────────
+  it("upgrade() fails loud when the Step 1 GitHub clone/install throws (#628)", () => {
+    const body = getUpgradeBody();
+    // Anchor on the catch block that handles the cloned-tree
+    // try/catch wrapping Steps 1+2 (git clone + npm install/build
+    // + in-place copy + registry update).
+    const anchorIdx = body.indexOf('"GitHub pull failed"');
+    expect(anchorIdx).toBeGreaterThan(-1);
+    // The relevant region is the catch body — bounded by the next
+    // top-level `// Step ` comment (Step 3 backup begins).
+    const stepBoundary = body.indexOf("// Step 3", anchorIdx);
+    expect(stepBoundary).toBeGreaterThan(anchorIdx);
+    const catchRegion = body.slice(anchorIdx, stepBoundary);
+
+    // (1) Non-zero exit signal — process.exitCode = 1 OR re-throw.
+    const failsLoud =
+      /process\.exitCode\s*=\s*[1-9]/.test(catchRegion) ||
+      /process\.exit\s*\(\s*[1-9]/.test(catchRegion) ||
+      /\bthrow\s+/.test(catchRegion);
+    expect(failsLoud).toBe(true);
+
+    // (2) The misleading "Continuing with hooks/settings fix..."
+    //     string MUST be gone — it taught users to trust a broken
+    //     upgrade.
+    expect(catchRegion).not.toMatch(/Continuing with hooks\/settings fix/);
+
+    // (3) Some recovery hint must be present so the user is not
+    //     stranded. Accept any of: re-run guidance, manual install
+    //     pointer, doctor pointer, ctx-doctor reference, or an
+    //     installed_plugins.json mention (which is the workaround
+    //     the #628 reporter had to discover themselves).
+    const hasRecoveryHint =
+      /ctx-doctor/.test(catchRegion) ||
+      /try again|retry|re-run|rerun/i.test(catchRegion) ||
+      /installed_plugins\.json/.test(catchRegion) ||
+      /npm install -g/.test(catchRegion) ||
+      /marketplace/i.test(catchRegion);
+    expect(hasRecoveryHint).toBe(true);
+  });
 });

@@ -1342,8 +1342,13 @@ server.registerTool(
         .coerce.number()
         .optional()
         .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs (which is the right layer for this policy). Pass an explicit value for long-running builds (Gradle/Maven/SBT)."),
+      // background: wrapped in coerceBoolean preprocessor so the literal
+      // strings "true"/"false" arriving from OpenCode's native plugin
+      // bridge (and several LLM providers' tool-call JSON) parse as the
+      // boolean the handler expects. z.coerce.boolean() is unsafe here —
+      // Boolean("false") is true. Fixes #627.
       background: z
-        .boolean()
+        .preprocess(coerceBoolean, z.boolean())
         .optional()
         .default(false)
         .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
@@ -1893,17 +1898,53 @@ const SEARCH_MAX_RESULTS_AFTER = 3; // after 3 calls: 1 result per query
 const SEARCH_BLOCK_AFTER = 8; // after 8 calls: refuse, demand batching
 
 /**
- * Defensive coercion: parse stringified JSON arrays.
- * Works around Claude Code double-serialization bug where array params
- * are sent as JSON strings (e.g. "[\"a\",\"b\"]" instead of ["a","b"]).
- * See: https://github.com/anthropics/claude-code/issues/34520
+ * Defensive coercion: parse stringified JSON arrays, AND lift a bare
+ * non-empty string into a single-element array.
+ *
+ * Two shapes show up from the wild:
+ *   1. `"[\"a\",\"b\"]"` — Claude Code double-serialization bug
+ *      (https://github.com/anthropics/claude-code/issues/34520).
+ *   2. `"single query"` — some LLM providers / OpenCode's native plugin
+ *      bridge deliver a single string when the schema expects `string[]`
+ *      (issue #627). v1.0.139 (#621) made the bridge run the Zod schema,
+ *      so this now surfaces as `Expected array, received string`. The
+ *      ergonomic recovery is to treat it as `["single query"]`.
+ *
+ * An empty string is intentionally NOT lifted — empty input should still
+ * fail Zod's `.min(1)` check rather than masquerade as `[""]`.
  */
 function coerceJsonArray(val: unknown): unknown {
   if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.length === 0) return val; // let zod produce "non-empty" error
     try {
       const parsed = JSON.parse(val);
       if (Array.isArray(parsed)) return parsed;
-    } catch { /* not valid JSON, let zod handle the error */ }
+    } catch { /* fall through — not JSON, treat as bare-string lift */ }
+    // Bare-string lift (#627): single query delivered as a plain string.
+    return [val];
+  }
+  return val;
+}
+
+/**
+ * Defensive coercion: accept the string literals "true"/"false" as
+ * booleans. The OpenCode native plugin bridge (and several LLM providers'
+ * tool-call JSON) stringifies primitives — `background:"false"` instead
+ * of `background:false`, `confirm:"true"` instead of `confirm:true`.
+ *
+ * We deliberately do NOT use `z.coerce.boolean()` for boolean fields:
+ * `Boolean("false")` is `true`, so Zod's coerce path silently flips the
+ * meaning. This helper recognises only the documented literal forms and
+ * passes anything else through untouched so Zod surfaces the right error.
+ *
+ * Fixes #627.
+ */
+function coerceBoolean(val: unknown): unknown {
+  if (typeof val === "string") {
+    const t = val.trim().toLowerCase();
+    if (t === "true") return true;
+    if (t === "false") return false;
   }
   return val;
 }
@@ -1937,8 +1978,16 @@ server.registerTool(
         .array(z.string())
         .optional()
         .describe("Array of search queries. Batch ALL questions in one call.")),
+      // limit: z.coerce.number() (not z.number()) — OpenCode's native
+      // plugin path delivers tool args straight from the LLM provider's
+      // tool-call JSON, where several providers stringify primitives
+      // (limit:"4" instead of limit:4). Since v1.0.139 / #621 we run
+      // inputSchema.parse() on that path, so a plain z.number() rejects
+      // "4" with "Expected number, received string". z.coerce mirrors what
+      // ctx_batch_execute / ctx_fetch_and_index / ctx_execute already do.
+      // Fixes #627.
       limit: z
-        .number()
+        .coerce.number()
         .optional()
         .default(3)
         .describe("Results per query (default: 3)"),
@@ -3495,7 +3544,11 @@ server.registerTool(
     // .superRefine() wrapper. See block comment above & issue #563. The
     // cross-field ambiguity check lives in the handler body below.
     inputSchema: z.object({
-      confirm: z.boolean().describe(
+      // confirm: wrapped in coerceBoolean preprocessor — OpenCode's native
+      // plugin bridge can deliver `confirm:"true"` / `confirm:"false"` as
+      // string literals. Without this, v1.0.139's inputSchema.parse() path
+      // rejects valid intent as "Expected boolean, received string" (#627).
+      confirm: z.preprocess(coerceBoolean, z.boolean()).describe(
         "MUST be true. Destructive operation; false returns 'purge cancelled'."
       ),
       sessionId: z.string().optional().describe(

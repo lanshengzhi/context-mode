@@ -4825,3 +4825,60 @@ test("OpenCode/Kilo legacy MCP child emits stderr diagnostic when ctx_* suppress
   expect(matches.length).toBe(1);
   __resetSuppressionDiagnosticForTests();
 });
+
+// Issue #637: an operator who inspects the suppressed legacy MCP child via
+// `tools/list` (or whose MCP host probes it on connect) currently receives a
+// JSON-RPC -32601 "Method not found" error — because no `registerTool()` call
+// survives the suppression shim, the SDK's `setToolRequestHandlers()` never
+// runs and `tools/list` is therefore unregistered. To an outside observer that
+// looks identical to a broken server and they reasonably conclude "the plugin
+// never registers any ctx_* tools" (#637's headline framing). The real story
+// is "the MCP child was intentionally muted; the plugin path is serving the
+// tools natively" — already conveyed via the #623 stderr diagnostic, but
+// JSON-RPC consumers don't read stderr.
+//
+// Fix: register an explicit empty `tools/list` handler whenever suppression
+// is active, so the wire response becomes `{tools: []}` (spec-compliant,
+// matches what operators expect) paired with the existing stderr diagnostic.
+// This eliminates the misleading -32601 that started #637.
+test("registerEmptyToolsListHandler responds with {tools:[]} so operators don't see -32601 on suppressed MCP child (#637)", async () => {
+  // The user-facing failure mode that drove issue #637: an operator inspecting
+  // the suppressed legacy MCP child via `tools/list` (or whose MCP host probes
+  // it during connect) receives JSON-RPC -32601 "Method not found" because the
+  // SDK only registers tools/list when `registerTool()` actually goes through —
+  // and the #623 suppression shim returns undefined for every registration.
+  // The reporter reads -32601 as "the plugin never registers any ctx_* tools",
+  // which is the headline framing of #637.
+  //
+  // Fix: an exported helper that installs an explicit empty tools/list handler
+  // when suppression is active. The bundle entry point calls it at module-init
+  // time (alongside the prompts/resources handlers at server.ts:259-261).
+  //
+  // We test the helper in isolation against a fresh McpServer wired through an
+  // in-memory transport to a Client. This avoids the module-load-time pinning
+  // of `suppressMcpToolsForNativePluginHost` and gives a deterministic loop
+  // that does not depend on the build bundle being present.
+  const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+  const { registerEmptyToolsListHandler } = await import("../../src/server.js");
+
+  const mcp = new McpServer({ name: "issue-637-isolated", version: "0.0.0" });
+  registerEmptyToolsListHandler(mcp);
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([
+    mcp.server.connect(serverTransport),
+    (async () => {
+      const client = new Client({ name: "issue-637-probe", version: "0.0.0" }, { capabilities: {} });
+      await client.connect(clientTransport);
+      const listed = await client.listTools();
+      // Pre-fix: client.listTools() throws -32601 Method not found.
+      // Post-fix: returns { tools: [] }.
+      expect(listed).toBeDefined();
+      expect(Array.isArray(listed.tools)).toBe(true);
+      expect(listed.tools.length).toBe(0);
+      await client.close();
+    })(),
+  ]);
+}, 15_000);

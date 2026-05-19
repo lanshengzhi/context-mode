@@ -225,6 +225,45 @@ export function __resetSuppressionDiagnosticForTests(): void {
   __suppressionDiagnosticEmitted = false;
 }
 
+/**
+ * Issue #637 — register an explicit empty `tools/list` handler on the McpServer.
+ *
+ * Background: when `suppressMcpToolsForNativePluginHost` is true, every
+ * `server.registerTool()` call is short-circuited (returns `undefined` above).
+ * The MCP SDK only installs the SDK-default `tools/list` handler when at least
+ * one `registerTool()` reaches `setToolRequestHandlers()` internally
+ * (mcp.js:56-67). Suppressing every registration leaves `tools/list`
+ * unregistered, and the framework's RPC layer answers it with
+ * `-32601 "Method not found"`.
+ *
+ * The reporter of #637 (SquirrelRat) inspected the suppressed child via
+ * `tools/list` and read the JSON-RPC error as "the plugin never registers any
+ * ctx_* tools" — when in fact the plugin DOES register all 11 tools natively
+ * (verified at `src/adapters/opencode/plugin.ts:469` and
+ * `tests/opencode-plugin.test.ts:88`). The misleading -32601 is the seed of
+ * the #637 perception.
+ *
+ * This helper installs an explicit handler that returns `{tools: []}` — a
+ * spec-compliant empty list. Paired with the existing #623 stderr diagnostic,
+ * an operator now sees:
+ *   - wire response: `{tools: []}` (matches expectation, no JSON-RPC error)
+ *   - stderr: `[context-mode] ctx_* tools/list intentionally empty… (#623)`
+ *
+ * Idempotent: throws inside SDK if called twice on the same server because
+ * `assertCanSetRequestHandler` (mcp.js:60) rejects duplicate registrations;
+ * we therefore install the SDK's default tool handlers FIRST (via a no-op
+ * registerTool of a fake tool, immediately removed) only if needed. To keep
+ * the public surface minimal, we just call `server.server.setRequestHandler`
+ * directly — that is the same low-level call used for prompts/resources at
+ * server.ts:259-261 and avoids the SDK guard entirely.
+ *
+ * Exported for test (#637 in-memory regression guard).
+ */
+export function registerEmptyToolsListHandler(target: McpServer = server): void {
+  target.server.registerCapabilities({ tools: { listChanged: false } });
+  target.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+}
+
 const originalRegisterTool = server.registerTool.bind(server);
 (server as unknown as { registerTool: (...args: unknown[]) => unknown }).registerTool = (...args: unknown[]) => {
   const [name, config, handler] = args as [
@@ -240,6 +279,17 @@ const originalRegisterTool = server.registerTool.bind(server);
   return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
 };
 
+// Issue #637 — when suppression is active, install the empty tools/list handler
+// once at module-init time so the suppressed MCP child responds with
+// `{tools: []}` instead of JSON-RPC `-32601 Method not found`. Pair with the
+// #623 stderr diagnostic that explains WHY the list is empty. Skipped for the
+// embedded plugin-import path because the embedded process is not the stdio
+// MCP child an operator would inspect — it lives inside the OpenCode/Kilo
+// host and never speaks JSON-RPC over stdio.
+if (suppressMcpToolsForNativePluginHost && process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+  registerEmptyToolsListHandler(server);
+}
+
 type ToolContextOverride = { projectDir: string; sessionId?: string };
 const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
 
@@ -254,7 +304,7 @@ export async function withProjectDirOverride<T>(
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
 // OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
 // the SDK transport layer, causing subsequent listTools() calls to fail permanently.
-import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false } });
 server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));

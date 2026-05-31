@@ -3583,6 +3583,15 @@ EXAMPLE: ctx_batch_execute(
         .slice(0, 80)}`;
       const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
 
+      // Commands inventory — list what the agent actually ran so the
+      // response itself documents intent, not just per-section echoes.
+      // Placed before "## Indexed Sections" so it scans top-down with
+      // the human asking "what just happened" (Issues #717 + #736).
+      const commandsInventory: string[] = ["## Commands", ""];
+      for (const c of commands) {
+        commandsInventory.push(`- ${c.label}: \`${truncateCommandForEcho(c.command)}\``);
+      }
+
       // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
       const allSections = store.getChunksBySource(indexed.sourceId);
       const inventory: string[] = ["## Indexed Sections", ""];
@@ -3607,6 +3616,8 @@ EXAMPLE: ctx_batch_execute(
       const output = [
         `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
           `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
+        "",
+        ...commandsInventory,
         "",
         ...inventory,
         "",

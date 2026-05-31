@@ -222,6 +222,59 @@ describe("issue #717 — ctx_execute echoes the language + code it ran", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Behaviour 6 — ctx_batch_execute summary carries a "## Commands" inventory
+//               so the response itself (not just per-section echoes) lists
+//               every command the agent ran. Placed before "## Indexed
+//               Sections" per the issue templates.
+// ════════════════════════════════════════════════════════════════════════════
+describe("issue #736 — ctx_batch_execute summary includes a Commands inventory", () => {
+  let projectDir: string;
+  beforeAll(() => {
+    projectDir = mkdtempSync(join(tmpdir(), "echo-batch-"));
+  });
+  afterAll(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  test("response carries `## Commands` listing each `- <label>: \\`<command>\\`` before `## Indexed Sections`", async () => {
+    const proc = spawnServer({ CLAUDE_PROJECT_DIR: projectDir });
+    try {
+      await initServer(proc);
+      const resp = await awaitRpc(proc, 102, {
+        jsonrpc: "2.0", id: 102, method: "tools/call",
+        params: {
+          name: "ctx_batch_execute",
+          arguments: {
+            commands: [
+              { label: "alpha", command: "echo alpha-output" },
+              { label: "bravo", command: "echo bravo-output" },
+              { label: "charlie", command: "echo charlie-output" },
+            ],
+            queries: ["alpha"],
+          },
+        },
+      });
+      expect(resp?.error).toBeUndefined();
+      const text = resp?.result?.content?.[0]?.text ?? "";
+
+      // Commands inventory present
+      expect(text).toContain("## Commands");
+      expect(text).toMatch(/- alpha: `echo alpha-output`/);
+      expect(text).toMatch(/- bravo: `echo bravo-output`/);
+      expect(text).toMatch(/- charlie: `echo charlie-output`/);
+      // Ordering: Commands BEFORE Indexed Sections
+      const cmdIdx = text.indexOf("## Commands");
+      const secIdx = text.indexOf("## Indexed Sections");
+      expect(cmdIdx).toBeGreaterThan(-1);
+      expect(secIdx).toBeGreaterThan(-1);
+      expect(cmdIdx).toBeLessThan(secIdx);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Behaviour 5 — ctx_execute_file echoes path + code before stdout
 // ════════════════════════════════════════════════════════════════════════════
 describe("issue #717 — ctx_execute_file echoes the path + code it ran", () => {

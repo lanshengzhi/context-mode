@@ -17,9 +17,9 @@
 import * as p from "@clack/prompts";
 import color from "picocolors";
 import { execFileSync, execSync, execFile as nodeExecFile, type ExecSyncOptions } from "node:child_process";
-import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, constants } from "node:fs";
+import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, lstatSync, realpathSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, sep } from "node:path";
 import { tmpdir, devNull, homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -1202,10 +1202,37 @@ async function upgrade(opts?: { platform?: string }) {
         ...(clonedPkg.files || []),
         "src", "package.json",
       ];
+      // Supply-chain containment on items[]. A compromised upstream tag
+      // shipping files: ["../../.ssh/authorized_keys"] or an absolute
+      // path would, without a guard, hand rmSync+cpSync an arbitrary
+      // destination under the user's UID. resolve(P, "/abs") discards P,
+      // so the absolute-path variant escapes too. Reject items whose
+      // resolved path escapes either srcDir or pluginRoot. Mirrors the
+      // pattern hooks/heal-partial-install.mjs already uses for its own
+      // files[] expansion (PR #699).
+      //
+      // Also refuse to copy any symlink encountered anywhere under a
+      // source item. cpSync's default is to preserve source symlinks as
+      // destination symlinks; a compromised upstream tag committing a
+      // symlink to /etc inside src/ would plant that link in pluginRoot,
+      // and the next Claude Code session that loads pluginRoot/src/*
+      // would dereference through to the attacker target. Filtering at
+      // copy time keeps pluginRoot symlink-free regardless of what the
+      // clone shipped.
+      const pluginRootWithSep = resolve(pluginRoot) + sep;
+      const srcDirWithSep = resolve(srcDir) + sep;
+      const refuseSymlinks = (src: string): boolean => {
+        try { return !lstatSync(src).isSymbolicLink(); } catch { return false; }
+      };
       for (const item of items) {
+        const from = resolve(srcDir, item);
+        const to = resolve(pluginRoot, item);
+        if (!(to + sep).startsWith(pluginRootWithSep)) continue;
+        if (!(from + sep).startsWith(srcDirWithSep)) continue;
+        if (!refuseSymlinks(from)) continue;
         try {
-          rmSync(resolve(pluginRoot, item), { recursive: true, force: true });
-          cpSync(resolve(srcDir, item), resolve(pluginRoot, item), { recursive: true });
+          rmSync(to, { recursive: true, force: true });
+          cpSync(from, to, { recursive: true, filter: refuseSymlinks });
         } catch { /* some files may not exist in source */ }
       }
 
@@ -1511,19 +1538,48 @@ async function upgrade(opts?: { platform?: string }) {
       // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so the registry lookup
       // tracks relocated CC config trees.
       try {
-        const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+        const claudeRoot = resolveClaudeConfigDir();
+        const registryPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
         if (existsSync(registryPath)) {
+          // The registry's installPath fields are written by Claude Code under
+          // <claudeRoot>/plugins/cache/<marketplace>/<plugin>/<version>. Any other
+          // shape means the registry has been tampered with by a co-resident
+          // plugin, a malicious postinstall script, or another local actor.
+          // Without containment, cpSync would happily recursive-write the in-repo
+          // skills/ tree to /etc/skills, ~/.ssh/skills, or wherever the attacker
+          // pointed. server.ts:790 (healCacheMidSession) already gates the same
+          // field this way; the symmetric guard belongs here too.
+          //
+          // The lexical resolve+startsWith check rejects ".."-escapes and
+          // absolute paths outside cacheRoot, but path.resolve doesn't
+          // dereference symlinks. A same-uid actor who can plant a symlink
+          // AT <cacheRoot>/<owner>/<plugin>/<version> targeting an attacker
+          // dir gets past the lexical guard, then cpSync follows the link at
+          // FS-write time. Re-check via realpathSync so a planted symlink
+          // anchor fails the gate.
+          const cacheRoot = resolve(claudeRoot, "plugins", "cache");
+          let cacheRootCanon: string;
+          try { cacheRootCanon = realpathSync(cacheRoot); }
+          catch { cacheRootCanon = cacheRoot; }
+          const cacheRootWithSep = cacheRootCanon + sep;
           const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
           const entries = registry?.plugins?.["context-mode@context-mode"];
           if (Array.isArray(entries)) {
             for (const entry of entries) {
-              const installPath = entry.installPath;
-              if (installPath && installPath !== pluginRoot && existsSync(installPath)) {
-                const srcSkills = resolve(srcDir, "skills");
-                if (existsSync(srcSkills)) {
-                  cpSync(srcSkills, resolve(installPath, "skills"), { recursive: true });
-                  changes.push(`Synced skills to active install path`);
-                }
+              const installPath = entry?.installPath;
+              if (typeof installPath !== "string" || !installPath) continue;
+              if (installPath === pluginRoot) continue;
+              const resolvedInstallPath = resolve(installPath);
+              if (!(resolvedInstallPath + sep).startsWith(cacheRootWithSep)) continue;
+              if (!existsSync(resolvedInstallPath)) continue;
+              let realInstallPath: string;
+              try { realInstallPath = realpathSync(resolvedInstallPath); }
+              catch { continue; }
+              if (!(realInstallPath + sep).startsWith(cacheRootWithSep)) continue;
+              const srcSkills = resolve(srcDir, "skills");
+              if (existsSync(srcSkills)) {
+                cpSync(srcSkills, resolve(realInstallPath, "skills"), { recursive: true });
+                changes.push(`Synced skills to active install path`);
               }
             }
           }
@@ -1689,14 +1745,37 @@ function statuslineForward(): void {
   try {
     const registryPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
     if (existsSync(registryPath)) {
+      // Same trust boundary as the cpSync site in upgrade() and as
+      // server.ts:790's healCacheMidSession: only honor installPath values
+      // that resolve under <claudeRoot>/plugins/cache. A stray /etc or
+      // ~/.ssh entry written by another local actor must not become the
+      // script the statusline forwarder imports, since statusline re-fires
+      // several times per second and would hand the attacker durable RCE
+      // on the user's behalf.
+      //
+      // path.resolve is purely lexical, so a same-uid actor who can plant
+      // a symlink at <cacheRoot>/<owner>/<plugin>/<version> targeting an
+      // attacker dir would pass the lexical gate. Re-check via
+      // realpathSync so the dynamic-import target's actual on-disk
+      // location also stays under cacheRoot.
+      const cacheRoot = resolve(claudeRoot, "plugins", "cache");
+      let cacheRootCanon: string;
+      try { cacheRootCanon = realpathSync(cacheRoot); }
+      catch { cacheRootCanon = cacheRoot; }
+      const cacheRootWithSep = cacheRootCanon + sep;
       const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
       const entries = registry?.plugins?.["context-mode@context-mode"];
       if (Array.isArray(entries)) {
         for (const entry of entries) {
           const installPath = entry?.installPath;
-          if (typeof installPath === "string" && installPath) {
-            candidates.push(resolve(installPath, "bin", "statusline.mjs"));
-          }
+          if (typeof installPath !== "string" || !installPath) continue;
+          const resolvedInstallPath = resolve(installPath);
+          if (!(resolvedInstallPath + sep).startsWith(cacheRootWithSep)) continue;
+          let realInstallPath: string;
+          try { realInstallPath = realpathSync(resolvedInstallPath); }
+          catch { continue; }
+          if (!(realInstallPath + sep).startsWith(cacheRootWithSep)) continue;
+          candidates.push(resolve(realInstallPath, "bin", "statusline.mjs"));
         }
       }
     }

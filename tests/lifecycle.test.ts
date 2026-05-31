@@ -7,16 +7,53 @@
 
 import { describe, test, assert } from "vitest";
 import { spawn, execSync } from "node:child_process";
-import { writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { startLifecycleGuard, makeDefaultIsParentAlive } from "../src/lifecycle.js";
 
-const TSX_PATH = execSync("which tsx", { encoding: "utf-8" }).trim();
+// Resolve the tsx binary. Prefer the local devDep so the test doesn't depend
+// on a global tsx install or on Git Bash's `which` being on PATH; the PATH
+// probe is a fallback for environments where node_modules/.bin isn't
+// populated. Windows ships tsx as tsx.cmd and uses `where`; everywhere else
+// it's `tsx` with `which`.
+function resolveTsxPath(): string {
+  const isWindows = process.platform === "win32";
+  const localBin = join(
+    process.cwd(),
+    "node_modules",
+    ".bin",
+    isWindows ? "tsx.cmd" : "tsx",
+  );
+  if (existsSync(localBin)) return localBin;
+  const probe = isWindows ? "where tsx" : "which tsx";
+  return execSync(probe, { encoding: "utf-8" }).trim().split(/\r?\n/)[0];
+}
+const TSX_PATH = resolveTsxPath();
+const PROJECT_ROOT = process.cwd();
+// file:// URL form so the spawned ESM module can import lifecycle.ts by
+// absolute path regardless of where the script itself lives.
+const LIFECYCLE_SRC_URL = pathToFileURL(
+  join(PROJECT_ROOT, "src", "lifecycle.ts"),
+).href;
 
-function spawnGuardChild(exitCode: number): { child: ReturnType<typeof spawn>; ready: Promise<void> } {
-  const script = join(process.cwd(), `_lifecycle_test_${exitCode}.ts`);
+// Sandboxed write target. Pre-fix this wrote _lifecycle_test_*.ts directly
+// to process.cwd() (the project root) and only cleaned up on the child's
+// `close` event. A hang or hard crash left the temp scripts in the repo
+// (not gitignored). Use a per-test mkdtempSync directory under tmpdir
+// instead so partial state can't escape the sandbox even when the child
+// dies without firing its close handler. The vitest worker tears down its
+// per-test environment when the run ends, so worst case the dir lingers
+// only for the lifetime of the run.
+function spawnGuardChild(exitCode: number): {
+  child: ReturnType<typeof spawn>;
+  ready: Promise<void>;
+} {
+  const scratchDir = mkdtempSync(join(tmpdir(), "ctx-lifecycle-test-"));
+  const script = join(scratchDir, `guard_${exitCode}.ts`);
   writeFileSync(script, `
-import { startLifecycleGuard } from "./src/lifecycle.ts";
+import { startLifecycleGuard } from ${JSON.stringify(LIFECYCLE_SRC_URL)};
 startLifecycleGuard({
   checkIntervalMs: 60000,
   onShutdown: () => process.exit(${exitCode}),
@@ -25,10 +62,12 @@ process.stdout.write("READY");
 setInterval(() => {}, 1000);
 `);
   const child = spawn(TSX_PATH, [script], {
-    cwd: process.cwd(),
+    cwd: PROJECT_ROOT,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.on("close", () => { try { unlinkSync(script); } catch {} });
+  child.on("close", () => {
+    try { rmSync(scratchDir, { recursive: true, force: true }); } catch {}
+  });
   const ready = new Promise<void>((resolve) => {
     child.stdout!.on("data", (chunk: Buffer) => {
       if (chunk.toString().includes("READY")) resolve();

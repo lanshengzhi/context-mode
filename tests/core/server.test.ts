@@ -1870,6 +1870,84 @@ describe("ctx_insight: port schema rejects invalid values (#441)", () => {
   }, 20_000);
 });
 
+describe("ctx_insight: explicit sessionDir/contentDir containment", () => {
+  // The handler resolves sessionDir / contentDir overrides and passes them
+  // to the spawned insight server as INSIGHT_SESSION_DIR / INSIGHT_CONTENT_DIR.
+  // The server then enumerates every *.db file in those dirs (info disclosure)
+  // and, for hex-named files, can DELETE rows via /api/content. Without
+  // containment, a prompt-injected MCP caller passing sessionDir="/etc" or
+  // contentDir="~/.ssh" turns the dashboard into a confused-deputy
+  // enumerator over the user's filesystem. The fix gates explicit overrides
+  // against the adapter's config root: broad enough for the documented
+  // "multi-install setups or pointing at a sibling project's data" use case,
+  // narrow enough to block /etc, ~/.ssh, /tmp/<foreign-user>, etc.
+
+  const SERVER_SOURCE = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("ctx_insight handler rejects explicit overrides outside the containment root", () => {
+    // Slice to the ctx_insight handler body. Bounded by the registerTool
+    // call for "ctx_insight" and the next "// ── " section divider that
+    // closes the handler.
+    const handlerStart = SERVER_SOURCE.indexOf('server.registerTool(\n  "ctx_insight"');
+    expect(handlerStart).toBeGreaterThan(0);
+    const handlerSlice = SERVER_SOURCE.slice(handlerStart, handlerStart + 12000);
+    expect(handlerSlice).toContain("Confused-deputy guard on explicit overrides");
+    expect(handlerSlice).toMatch(
+      /if \(explicitSessionDir \|\| explicitContentDir\) \{/,
+    );
+    expect(handlerSlice).toMatch(/const containmentRoot = dirname\(dirname\(defaultSessDir\)\);/);
+    expect(handlerSlice).toMatch(/const containmentRootWithSep = resolve\(containmentRoot\) \+ sep;/);
+    expect(handlerSlice).toMatch(
+      /Error: sessionDir must resolve under \$\{containmentRoot\}/,
+    );
+    expect(handlerSlice).toMatch(
+      /Error: contentDir must resolve under \$\{containmentRoot\}/,
+    );
+  });
+
+  test("algorithm: containment accepts in-tree dirs and rejects /etc and traversal escapes", () => {
+    // Replay the guard logic against a sandbox tree whose default sessions
+    // dir is <root>/.claude/context-mode/sessions. The containment root
+    // derives as dirname(dirname(defaultSessDir)) = <root>/.claude.
+    const base = mkdtempSync(join(tmpdir(), "ctx-insight-containment-"));
+    try {
+      const fakeClaudeRoot = join(base, ".claude");
+      const defaultSessDir = join(fakeClaudeRoot, "context-mode", "sessions");
+      mkdirSync(defaultSessDir, { recursive: true });
+
+      const sepLocal = require("node:path").sep as string;
+      const dirnameLocal = (require("node:path") as typeof import("node:path")).dirname;
+      const containmentRoot = dirnameLocal(dirnameLocal(defaultSessDir));
+      const containmentRootWithSep = resolve(containmentRoot) + sepLocal;
+      const isContained = (dir: string): boolean =>
+        (resolve(dir) + sepLocal).startsWith(containmentRootWithSep);
+
+      // In-tree: legitimate.
+      expect(isContained(defaultSessDir)).toBe(true);
+      expect(isContained(join(fakeClaudeRoot, "context-mode", "content"))).toBe(true);
+      expect(isContained(join(fakeClaudeRoot, "other-install", "sessions"))).toBe(true);
+
+      // Outside the containment root: rejected.
+      expect(isContained("/etc")).toBe(false);
+      expect(isContained(join(base, ".ssh"))).toBe(false);
+      expect(isContained(join(base, "elsewhere"))).toBe(false);
+
+      // Relative-".." escape: resolves outside, rejected.
+      expect(isContained(join(defaultSessDir, "..", "..", "..", "elsewhere"))).toBe(false);
+
+      // Prefix collision: a sibling whose name starts with the same chars
+      // as containmentRoot must not slip through. The trailing sep on
+      // containmentRoot is the safeguard.
+      expect(isContained(fakeClaudeRoot + "-evil")).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ctx_execute_file: projectRoot env cascade parity with ctx_index
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2364,7 +2442,12 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     expect(serverSrc).toContain('readFileSync(join(T,"package.json"),"utf8")');
     expect(serverSrc).toContain("pkg.files");
     expect(serverSrc).toContain("Array.isArray(pkg.files)");
-    expect(serverSrc).toContain("cpSync(from,to,{recursive:true,force:true})");
+    // The inline cpSync passes `filter:noSymlink` to refuse copying symlinks
+    // back into the plugin tree. Anchor on this shape so future drift toward
+    // the unfiltered form is caught.
+    expect(serverSrc).toContain(
+      "cpSync(from,to,{recursive:true,force:true,filter:noSymlink})",
+    );
     expect(serverSrc).toMatch(/npm.*install/);
   });
 
@@ -6167,4 +6250,167 @@ describe("ctx_index: directory path support (#687)", () => {
       try { proc.kill("SIGTERM"); } catch { /* best effort */ }
     }
   }, 30_000);
+});
+
+describe("ctx_index: root-level symlink defense in directory dispatch", () => {
+  // The directory-dispatch branch used statSync to decide whether to walk
+  // a path as a directory. statSync follows symlinks, so a path like
+  // `/tmp/link -> /etc` reported as a directory and walkDirectoryDetailed
+  // then realpathSync'd internally and indexed /etc. The deny-glob check
+  // at the head of the handler had run against `/tmp/link`, not /etc, so a
+  // user whose deny globs include /etc but not /tmp would still see /etc
+  // contents land in the FTS5 store. Fix: detect root-level symlinks with
+  // lstatSync, realpath them once, and re-apply the deny check against
+  // the actual walk target before dispatching.
+
+  const SERVER_SOURCE = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("ctx_index handler lstats and re-deny-checks symlinks before directory dispatch", () => {
+    const dispatchBlock = SERVER_SOURCE.match(
+      /Root-level symlink defense[\s\S]*?if \(resolvedPath && existsSync\(resolvedPath\) && statSync\(resolvedPath\)\.isDirectory\(\)\)/,
+    );
+    expect(dispatchBlock).not.toBeNull();
+    const block = dispatchBlock![0];
+    expect(block).toMatch(/const lst = lstatSync\(resolvedPath\);/);
+    expect(block).toMatch(/lst\.isSymbolicLink\(\)/);
+    expect(block).toMatch(/realpathSync\(resolvedPath\)/);
+    expect(block).toMatch(
+      /const realDenied = checkFilePathDenyPolicy\(realTarget, "ctx_index"\);/,
+    );
+    expect(block).toMatch(/if \(realDenied\) return realDenied;/);
+    expect(SERVER_SOURCE).toMatch(
+      /import\s*\{[^}]*\brealpathSync\b[^}]*\}\s*from\s*"node:fs"/,
+    );
+  });
+
+  test("algorithm: lstatSync + realpath identifies a symlinked directory whose target differs", () => {
+    // The behavior the fix depends on: lstatSync on a symlink reports
+    // isSymbolicLink()=true and isDirectory()=false. realpathSync resolves
+    // to the target. statSync, by contrast, would report isDirectory()=true
+    // and silently follow -- the pre-fix dispatch relied on that.
+    const base = mkdtempSync(join(tmpdir(), "ctx-index-symlink-defense-"));
+    try {
+      const realDir = join(base, "real");
+      const linkPath = join(base, "link");
+      mkdirSync(realDir, { recursive: true });
+      writeFileSync(join(realDir, "marker.txt"), "real");
+
+      const fsLocal = require("node:fs") as typeof import("node:fs");
+      // "junction" on Windows so the test works without admin / Developer
+      // Mode; lstatSync still reports isSymbolicLink()===true for junctions,
+      // which is what the algorithm-under-test depends on.
+      const symlinkType = process.platform === "win32" ? "junction" : "dir";
+      fsLocal.symlinkSync(realDir, linkPath, symlinkType);
+
+      const lst = fsLocal.lstatSync(linkPath);
+      expect(lst.isSymbolicLink()).toBe(true);
+      expect(lst.isDirectory()).toBe(false);
+      expect(fsLocal.statSync(linkPath).isDirectory()).toBe(true);
+
+      const real = fsLocal.realpathSync(linkPath);
+      expect(real).not.toBe(linkPath);
+      expect(real).toBe(fsLocal.realpathSync(realDir));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ctx_fetch_and_index: response body size cap", () => {
+  // ctx_fetch_and_index spawns a subprocess that fetches a URL, writes the
+  // response body to a tmpfile, exits, and the parent reads the file back
+  // into the long-running MCP server's heap via readFileSync. Without a
+  // cap, an unexpectedly large endpoint (or a slowloris that keeps
+  // appending chunks until the subprocess is killed) can either OOM the
+  // subprocess or, worse, propagate a multi-GB response into the parent
+  // heap and crash the MCP server. Cap to 50 MB on both ends.
+
+  const SERVER_SOURCE = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("subprocess buildFetchCode caps response via Content-Length and post-text length", () => {
+    expect(SERVER_SOURCE).toContain("const MAX_FETCH_BYTES = 50 * 1024 * 1024;");
+    expect(SERVER_SOURCE).toContain("async function safeText(resp)");
+    // The three response paths (JSON, HTML, default) all route through safeText
+    // instead of resp.text() directly.
+    const buildFetchSrc = SERVER_SOURCE.slice(
+      SERVER_SOURCE.indexOf("export function buildFetchCode"),
+      SERVER_SOURCE.indexOf("// fetch_and_index helpers"),
+    );
+    expect(buildFetchSrc.length).toBeGreaterThan(0);
+    expect(buildFetchSrc.match(/await safeText\(resp\)/g)?.length).toBeGreaterThanOrEqual(3);
+    // The pre-fix call sites (one per content-type branch) routed through
+    // `await resp.text()` directly. Now only one such call survives,
+    // inside safeText itself. Count exactly one.
+    const directCalls = buildFetchSrc.match(/await resp\.text\(\)/g) ?? [];
+    expect(directCalls.length).toBe(1);
+  });
+
+  test("parent-side fetchOneUrl stat-gates outputPath before readFileSync", () => {
+    const fetchOneUrlSrc = SERVER_SOURCE.slice(
+      SERVER_SOURCE.indexOf("async function fetchOneUrl"),
+      SERVER_SOURCE.indexOf("async function fetchOneUrl") + 6000,
+    );
+    expect(fetchOneUrlSrc).toContain("MAX_FETCH_OUTPUT_BYTES = 50 * 1024 * 1024");
+    expect(fetchOneUrlSrc).toMatch(/statSync\(outputPath\)\.size/);
+    expect(fetchOneUrlSrc).toMatch(/fileSize > MAX_FETCH_OUTPUT_BYTES/);
+  });
+});
+
+describe("getStatsFilePath: sanitize CLAUDE_SESSION_ID before path.join", () => {
+  // CLAUDE_SESSION_ID flows from the hosting process straight into a
+  // path.join, and path.join collapses ".." segments. CLAUDE_SESSION_ID=
+  // "../../evil" would write "stats-evil.json" two levels above statsDir.
+  // The env var is not under direct MCP-tool-caller control, but in CI /
+  // multi-tenant contexts where the host env is partly influenceable this
+  // is an arbitrary-write primitive. Reject any session id whose
+  // characters aren't [A-Za-z0-9._-] and fall back to pid-based id.
+
+  const SERVER_SOURCE = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("sanitizeSessionId exists and is called from getStatsFilePath", () => {
+    expect(SERVER_SOURCE).toMatch(/const SESSION_ID_RE = \/\^\[A-Za-z0-9\._-\]\+\$\//);
+    expect(SERVER_SOURCE).toContain("function sanitizeSessionId(raw: string): string {");
+    const getStatsSlice = SERVER_SOURCE.slice(
+      SERVER_SOURCE.indexOf("function getStatsFilePath"),
+      SERVER_SOURCE.indexOf("function getStatsFilePath") + 600,
+    );
+    expect(getStatsSlice).toMatch(/sanitizeSessionId\(raw\)/);
+    // The pre-fix direct splice of the env var into the join is gone.
+    expect(getStatsSlice).not.toMatch(
+      /join\(statsDir, `stats-\$\{process\.env\.CLAUDE_SESSION_ID/,
+    );
+  });
+
+  test("algorithm: sanitizer rejects traversal characters and falls back to pid", () => {
+    // Mirror the production sanitizer in isolation. The malicious shapes
+    // must all fall through to the pid-based id; the legitimate UUID-ish
+    // shape passes through unchanged.
+    const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
+    const sanitize = (raw: string): string =>
+      SESSION_ID_RE.test(raw) ? raw : `pid-${process.ppid}`;
+
+    expect(sanitize("../../evil")).toMatch(/^pid-\d+$/);
+    expect(sanitize("/etc/passwd")).toMatch(/^pid-\d+$/);
+    expect(sanitize("a/b")).toMatch(/^pid-\d+$/);
+    expect(sanitize("a\\b")).toMatch(/^pid-\d+$/);
+    expect(sanitize("..\\..")).toMatch(/^pid-\d+$/);
+    expect(sanitize("")).toMatch(/^pid-\d+$/);
+
+    // Legitimate ids pass through.
+    expect(sanitize("session-abc123")).toBe("session-abc123");
+    expect(sanitize("pid-12345")).toBe("pid-12345");
+    expect(sanitize("550e8400-e29b-41d4-a716-446655440000")).toBe(
+      "550e8400-e29b-41d4-a716-446655440000",
+    );
+    expect(sanitize("MyHost_2024.01")).toBe("MyHost_2024.01");
+  });
 });

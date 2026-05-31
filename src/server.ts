@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -911,8 +911,22 @@ let _lifetimeCache: { tokens: number; computedAt: number } | undefined;
  * (`pid-<parent pid>`), so a status line script can derive
  * the same id from `$PPID` without coupling to MCP.
  */
+// CLAUDE_SESSION_ID flows from the hosting process (Claude Code, pi, etc.)
+// straight into a path.join, and path.join collapses ".." into the result,
+// so a host env CLAUDE_SESSION_ID=../../evil writes "stats-evil.json" two
+// levels above statsDir. The env var is not under direct MCP-tool-caller
+// control, but in CI / multi-tenant contexts where the host env is partly
+// influenceable this is an arbitrary-write primitive within the MCP server
+// process's filesystem permissions. Constrain to a UUID-shaped charset
+// before splicing into the stats filename.
+const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
+function sanitizeSessionId(raw: string): string {
+  return SESSION_ID_RE.test(raw) ? raw : `pid-${process.ppid}`;
+}
+
 function getStatsFilePath(): string {
-  const sessionId = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
+  const raw = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
+  const sessionId = sanitizeSessionId(raw);
   const statsDir = ensureWritableStorageDir(resolveStatsStorageDir(getDefaultSessionDir));
   return join(statsDir, `stats-${sessionId}.json`);
 }
@@ -2045,6 +2059,33 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
       // resolved path is a directory, walk it bounded and re-enter `index()`
       // per-file so the security gate at store.ts:845 (TOCTOU defense from
       // #442 round-3) keeps running for every file.
+      //
+      // Root-level symlink defense: the deny-glob check above ran on the
+      // user-supplied `path`. If `path` is a symlink whose target lands in
+      // a sensitive directory (e.g. `/tmp/link -> /etc`), statSync would
+      // happily report directory and walkDirectoryDetailed would
+      // realpathSync internally, walking /etc with the user's deny globs
+      // bound to /tmp/link instead of the real target. Detect the symlink
+      // with lstatSync, follow it once, and re-apply the deny check
+      // against the realpath so the user's deny globs see the actual
+      // walk root.
+      if (resolvedPath && existsSync(resolvedPath)) {
+        const lst = lstatSync(resolvedPath);
+        if (lst.isSymbolicLink()) {
+          let realTarget: string;
+          try {
+            realTarget = realpathSync(resolvedPath);
+          } catch {
+            return trackResponse("ctx_index", {
+              content: [{ type: "text" as const, text: "Error: symlink target could not be resolved." }],
+            });
+          }
+          if (realTarget !== resolvedPath) {
+            const realDenied = checkFilePathDenyPolicy(realTarget, "ctx_index");
+            if (realDenied) return realDenied;
+          }
+        }
+      }
       if (resolvedPath && existsSync(resolvedPath) && statSync(resolvedPath).isDirectory()) {
         const store = getStore();
         const projectDir = getProjectDir();
@@ -2683,6 +2724,25 @@ async function fetchWithManualRedirect(initialUrl) {
   throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
 }
 
+// Subprocess response-body size cap. A malicious or unexpectedly large
+// endpoint reachable through ctx_fetch_and_index would otherwise stream
+// gigabytes into resp.text(), then into outputPath, then into the parent
+// MCP server's heap via readFileSync. 50 MB is far above typical web
+// page / API response sizes (~1-5 MB) but bounded enough to keep parent
+// heap survivable. Cap both early via Content-Length and after the read.
+const MAX_FETCH_BYTES = 50 * 1024 * 1024;
+async function safeText(resp) {
+  const cl = parseInt(resp.headers.get('content-length') || '0', 10);
+  if (cl > MAX_FETCH_BYTES) {
+    throw new Error('Response too large: Content-Length ' + cl + ' exceeds ' + MAX_FETCH_BYTES);
+  }
+  const text = await resp.text();
+  if (text.length > MAX_FETCH_BYTES) {
+    throw new Error('Response too large: ' + text.length + ' bytes exceeds ' + MAX_FETCH_BYTES);
+  }
+  return text;
+}
+
 async function main() {
   const resp = await fetchWithManualRedirect(url);
   if (!resp.ok) { console.error("HTTP " + resp.status); process.exit(1); }
@@ -2690,7 +2750,7 @@ async function main() {
 
   // --- JSON responses ---
   if (contentType.includes('application/json') || contentType.includes('+json')) {
-    const text = await resp.text();
+    const text = await safeText(resp);
     try {
       const pretty = JSON.stringify(JSON.parse(text), null, 2);
       emit('json', pretty);
@@ -2702,7 +2762,7 @@ async function main() {
 
   // --- HTML responses (default for text/html, application/xhtml+xml) ---
   if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
-    const html = await resp.text();
+    const html = await safeText(resp);
     const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
     td.use(gfm);
     td.remove(['script', 'style', 'nav', 'header', 'footer', 'noscript']);
@@ -2711,7 +2771,7 @@ async function main() {
   }
 
   // --- Everything else: plain text, CSV, XML, etc. ---
-  const text = await resp.text();
+  const text = await safeText(resp);
   emit('text', text);
 }
 main();
@@ -2946,6 +3006,16 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
     const header = (result.stdout || "").trim();
     let markdown: string;
     try {
+      // Parent-side defense-in-depth on the subprocess output size. The
+      // embedded safeText() in buildFetchCode already caps before writing,
+      // but a torn write (subprocess killed mid-write, fs cache desync,
+      // etc.) could still leave an oversized file. Bail before slurping
+      // multiple gigabytes into the long-running MCP server's heap.
+      const MAX_FETCH_OUTPUT_BYTES = 50 * 1024 * 1024;
+      const fileSize = statSync(outputPath).size;
+      if (fileSize > MAX_FETCH_OUTPUT_BYTES) {
+        return { kind: "fetch_error", url, error: `subprocess output ${fileSize} bytes exceeds cap ${MAX_FETCH_OUTPUT_BYTES}`, reason: "read" };
+      }
       markdown = readFileSync(outputPath, "utf-8").trim();
     } catch {
       return { kind: "fetch_error", url, error: "could not read subprocess output", reason: "read" };
@@ -3809,8 +3879,8 @@ server.registerTool(
       // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
       const scriptLines = [
         `import{execFileSync}from"node:child_process";`,
-        `import{cpSync,rmSync,existsSync,mkdtempSync,readFileSync,writeFileSync}from"node:fs";`,
-        `import{join}from"node:path";`,
+        `import{cpSync,rmSync,existsSync,mkdtempSync,readFileSync,writeFileSync,lstatSync}from"node:fs";`,
+        `import{join,resolve,sep}from"node:path";`,
         `import{tmpdir}from"node:os";`,
         `const P=${JSON.stringify(pluginRoot)};`,
         `const T=mkdtempSync(join(tmpdir(),"ctx-upgrade-"));`,
@@ -3823,7 +3893,18 @@ server.registerTool(
         `console.log("- [x] Built from source");`,
         `const pkg=JSON.parse(readFileSync(join(T,"package.json"),"utf8"));`,
         `const items=[...(Array.isArray(pkg.files)?pkg.files:[]),"src","package.json"];`,
-        `for(const item of items){const from=join(T,item);const to=join(P,item);if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true});}}`,
+        // Supply-chain containment on items[]. Mirror the cli.ts upgrade()
+        // guard: a compromised upstream package.json with files:["../etc"]
+        // would otherwise let path.join follow ".." out of pluginRoot.
+        // path.resolve normalizes "..", so the lexical startsWith catches
+        // both relative-".." traversal and absolute-path bypass. Plus a
+        // symlink filter so a committed symlink inside the clone can't
+        // plant itself in pluginRoot (cpSync default preserves source
+        // symlinks; a planted symlink in pluginRoot/src then redirects
+        // every subsequent load through to an attacker target).
+        `const PW=resolve(P)+sep;const TW=resolve(T)+sep;`,
+        `const noSymlink=(src)=>{try{return !lstatSync(src).isSymbolicLink()}catch{return false}};`,
+        `for(const item of items){const from=resolve(T,item);const to=resolve(P,item);if(!(to+sep).startsWith(PW))continue;if(!(from+sep).startsWith(TW))continue;if(!noSymlink(from))continue;if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true,filter:noSymlink});}}`,
         // Issue #609: do NOT write .mcp.json into the cache dir. Claude Code reads
         // .claude-plugin/plugin.json.mcpServers as the canonical MCP source — the
         // per-version .mcp.json file is a stale-write vector. Same architectural
@@ -4282,6 +4363,40 @@ server.registerTool(
     const sessDir = explicitSessionDir ? resolve(explicitSessionDir) : getSessionDir();
     const insightContentDirResolved = explicitContentDir ? resolve(explicitContentDir) : join(dirname(sessDir), "content");
     const cacheDir = join(dirname(sessDir), "insight-cache");
+
+    // Confused-deputy guard on explicit overrides. The spawned insight
+    // server reads every .db file under sessDir and insightContentDir, and
+    // its /api/content DELETE endpoint can rewrite hex-named .db files in
+    // those trees. A prompt-injected caller passing sessionDir="~/.ssh"
+    // or contentDir="~/.gnupg" would otherwise let the dashboard
+    // enumerate (and, for hex-named SQLite files, mutate rows in) those
+    // directories. Contain explicit overrides to the adapter's config
+    // root: broad enough for the documented "multi-install setups or
+    // pointing at a sibling project's data" use case, narrow enough to
+    // block /etc, ~/.ssh, /tmp/<foreign-user>, etc.
+    if (explicitSessionDir || explicitContentDir) {
+      const defaultSessDir = getSessionDir();
+      const containmentRoot = dirname(dirname(defaultSessDir));
+      const containmentRootWithSep = resolve(containmentRoot) + sep;
+      const isContained = (dir: string): boolean =>
+        (resolve(dir) + sep).startsWith(containmentRootWithSep);
+      if (explicitSessionDir && !isContained(sessDir)) {
+        return trackResponse("ctx_insight", {
+          content: [{
+            type: "text" as const,
+            text: `Error: sessionDir must resolve under ${containmentRoot} (got ${sessDir}).`,
+          }],
+        });
+      }
+      if (explicitContentDir && !isContained(insightContentDirResolved)) {
+        return trackResponse("ctx_insight", {
+          content: [{
+            type: "text" as const,
+            text: `Error: contentDir must resolve under ${containmentRoot} (got ${insightContentDirResolved}).`,
+          }],
+        });
+      }
+    }
 
     // Verify source exists
     if (!existsSync(join(insightSource, "server.mjs"))) {

@@ -13,9 +13,15 @@ const FETCH_TIMEOUT_MS = 2_000;
 const MAX_FIELD_LEN = 200;
 const MAX_DEPTH = 4;
 
+// Negative-cache sentinel — distinguishes "uninitialized" (null) from
+// "we checked recently and there's no config" (NO_CONFIG). Without this,
+// the unconfigured-user path would hit fs.readFileSync on every event.
+const NO_CONFIG = Symbol("no-config");
+
 let _cache = null;
 let _cacheLoadedAt = 0;
 let _warned = false; // dedupe stderr — log first failure only, reset on success
+let _fsLoads = 0;    // test-only counter: how many times readConfig hit the FS
 
 // === Cross-platform config path (bug-free across Win/Linux/Mac/WSL) ===
 export function configPath() {
@@ -52,8 +58,12 @@ function normalizeConfig(raw) {
 
 function readConfig() {
   const now = Date.now();
-  if (_cache && now - _cacheLoadedAt < CACHE_TTL_MS) return _cache;
+  // Cache hit — covers BOTH positive (config object) and negative (NO_CONFIG) results.
+  if (_cache !== null && now - _cacheLoadedAt < CACHE_TTL_MS) {
+    return _cache === NO_CONFIG ? null : _cache;
+  }
   _cacheLoadedAt = now;
+  _fsLoads++;
   const cfgPath = configPath();
 
   let raw;
@@ -61,7 +71,7 @@ function readConfig() {
     raw = fs.readFileSync(cfgPath, "utf8");
   } catch (e) {
     if (e.code !== "ENOENT") warn(`cannot read ${cfgPath}: ${e.code || e.message}`);
-    _cache = null;
+    _cache = NO_CONFIG;
     return null;
   }
 
@@ -70,20 +80,29 @@ function readConfig() {
     parsed = JSON.parse(raw);
   } catch (e) {
     warn(`${cfgPath} is not valid JSON: ${e.message}`);
-    _cache = null;
+    _cache = NO_CONFIG;
     return null;
   }
 
   const normalized = normalizeConfig(parsed);
   if (!normalized) {
     warn(`${cfgPath} schema invalid — expected {api_key (ctxm_*), platform_url}`);
-    _cache = null;
+    _cache = NO_CONFIG;
     return null;
   }
 
   _warned = false; // success — re-arm warning for future failures
   _cache = normalized;
   return _cache;
+}
+
+// === Gate — cheap boolean for callers that want to skip allocations entirely ===
+// `session-loaders.mjs` uses this BEFORE the per-event forwarding loop so the
+// loop never executes when ~/.context-mode/platform.json is missing. Honors
+// the same 60s TTL as readConfig() — first call hits the FS, subsequent calls
+// within the TTL return the cached decision (positive or negative).
+export function hasPlatformConfig() {
+  return readConfig() !== null;
 }
 
 // === URL construction (single endpoint per ADR-0006) ===
@@ -183,5 +202,6 @@ export const _internal = {
   sanitizeEvent,
   privacyTransform,
   configPath,
-  resetState: () => { _cache = null; _cacheLoadedAt = 0; _warned = false; },
+  resetState: () => { _cache = null; _cacheLoadedAt = 0; _warned = false; _fsLoads = 0; },
+  get fsLoads() { return _fsLoads; },
 };

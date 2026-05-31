@@ -10,6 +10,9 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 
+import { hasPlatformConfig, maybeForward } from "./platform-bridge.mjs";
+import { detectPlatformFromEnv } from "./core/platform-detect.mjs";
+
 export function createSessionLoaders(hookDir) {
   // Auto-detect bundle directory: bundles live in hooks/ root, not platform subdirs.
   // If hookDir itself has bundles, use it; otherwise go up one level.
@@ -96,5 +99,17 @@ export function attributeAndInsertEvents(db, sessionId, events, input, projectDi
       db.insertEvent(sessionId, events[i], hookName, attributions[i], bytesList?.[i]);
     }
   }
+
+  // PRD-context-as-a-service §5.2 — Forwarder injection.
+  // Gated: the per-event loop never runs when ~/.context-mode/platform.json
+  // is missing. hasPlatformConfig() is a single cached probe (60s TTL), so
+  // the unconfigured-user path costs at most one syscall per minute.
+  if (hasPlatformConfig()) {
+    const platform = detectPlatformFromEnv();
+    for (let i = 0; i < events.length; i++) {
+      maybeForward({ ...events[i], session_id: sessionId, ...attributions[i] }, platform);
+    }
+  }
+
   return attributions;
 }
